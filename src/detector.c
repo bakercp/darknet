@@ -1,3 +1,6 @@
+#include "dirent.h"
+#include "unistd.h"
+
 #include "network.h"
 #include "region_layer.h"
 #include "cost_layer.h"
@@ -438,6 +441,218 @@ void validate_detector_recall(char *cfgfile, char *weightfile)
     }
 }
 
+int ends_with(const char *str, const char *suffix)
+{
+    if (!str || !suffix)
+        return 0;
+    size_t lenstr = strlen(str);
+    size_t lensuffix = strlen(suffix);
+    if (lensuffix >  lenstr)
+        return 0;
+    return strncmp(str + lenstr - lensuffix, suffix, lensuffix) == 0;
+}
+
+
+void batch_test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filename, float thresh, float hier_thresh)
+{
+    list *options = read_data_cfg(datacfg);
+    char *name_list = option_find_str(options, "names", "data/names.list");
+    char **names = get_labels(name_list);
+
+    image **alphabet = load_alphabet();
+    network net = parse_network_cfg(cfgfile);
+
+    if(weightfile){
+        load_weights(&net, weightfile);
+    }
+
+    set_batch_network(&net, 1);
+    srand(2222222);
+    clock_t time;
+    char buff[512];
+
+    char dirname[512];
+
+    char *input = buff;
+    int j;
+    float nms=.4;
+
+
+    if (!filename)
+    {
+        printf("Need a directory quitting.");
+        return;
+    }
+
+    strncpy(dirname, filename, 512);
+
+    printf("DIRECTORY: %s\n", dirname);
+
+    DIR *dir;
+
+    struct dirent *ent;
+
+    if ((dir = opendir(dirname)) != NULL)
+    {
+        while ((ent = readdir (dir)) != NULL)
+        {
+            if (DT_REG == ent->d_type &&
+                (ends_with(ent->d_name, ".jpg") ||
+                 ends_with(ent->d_name, ".jpeg") ||
+                 ends_with(ent->d_name, ".JPG") ||
+                 ends_with(ent->d_name, ".JPEG") ||
+                 ends_with(ent->d_name, ".png") ||
+                 ends_with(ent->d_name, ".gif")
+                 ))
+            {
+                input = ent->d_name;
+
+                char image_path[1024];
+                char data_path[1024];
+                strcpy(image_path, dirname);
+                strcat(image_path, ent->d_name);
+
+                strcpy(data_path, image_path);
+                strcat(data_path, ".yolo.json");
+
+                if (access(data_path, F_OK ) != -1) {
+                    printf("Already cacluated %s\n", image_path);
+                    continue;
+                }
+
+                printf("Processing %s ... ", image_path);
+                fflush(stdout);
+
+                FILE * file;
+                file = fopen(data_path, "w");
+                
+                if (file)
+                {
+                    image im = load_image_color(image_path,0,0);
+
+                    image sized = resize_image(im, net.w, net.h);
+
+                    layer l = net.layers[net.n-1];
+
+                    box *boxes = calloc(l.w*l.h*l.n, sizeof(box));
+
+                    float **probs = calloc(l.w*l.h*l.n, sizeof(float *));
+
+                    for(j = 0; j < l.w*l.h*l.n; ++j)
+                    {
+                        probs[j] = calloc(l.classes + 1, sizeof(float *));
+                    }
+
+                    float *X = sized.data;
+
+                    time=clock();
+
+                    network_predict(net, X);
+
+                    get_region_boxes(l, 1, 1, thresh, probs, boxes, 0, 0, hier_thresh);
+
+                    if (l.softmax_tree && nms)
+                    {
+                        do_nms_obj(boxes, probs, l.w*l.h*l.n, l.classes, nms);
+                    }
+                    else if (nms)
+                    {
+                        do_nms_sort(boxes, probs, l.w*l.h*l.n, l.classes, nms);
+                    }
+
+                    // draw_detections(im, l.w*l.h*l.n, thresh, boxes, probs, names, alphabet, l.classes);
+
+                    float dt = sec(clock()-time);
+
+
+                    fprintf(file, "{\"dt\":%f,", dt);
+
+                    fprintf(file, "\"w\":%d,", im.w);
+                    fprintf(file, "\"h\":%d,", im.h);
+                    fprintf(file, "\"c\":%d,", im.c);
+                    fprintf(file, "\"thresh\":%f,", thresh);
+                    fprintf(file, "\"hier_thresh\":%f,", hier_thresh);
+
+                    fprintf(file, "\"dets\":[");
+
+                    int num = l.w*l.h*l.n;
+
+                    int isFirst = 1;
+
+                    for (int i = 0; i < num; ++i)
+                    {
+                        int class = max_index(probs[i], l.classes);
+                        float prob = probs[i][class];
+                        if(prob > thresh)
+                        {
+                            box b = boxes[i];
+
+                            int left  = (b.x-b.w/2.)*im.w;
+                            int right = (b.x+b.w/2.)*im.w;
+                            int top   = (b.y-b.h/2.)*im.h;
+                            int bot   = (b.y+b.h/2.)*im.h;
+
+                            if(left < 0) left = 0;
+                            if(right > im.w-1) right = im.w-1;
+                            if(top < 0) top = 0;
+                            if(bot > im.h-1) bot = im.h-1;
+                            
+                            if (isFirst)
+                            {
+                                isFirst = 0;
+                            }
+                            else
+                            {
+                                fprintf(file, ",");
+                            }
+
+                            fprintf(file, "{");
+                            fprintf(file, "\"label\":\"%s\",", names[class]);
+                            fprintf(file, "\"prob\":%f,", prob);
+                            fprintf(file, "\"rect\":{");
+                            fprintf(file, "\"x\":%d,", left);
+                            fprintf(file, "\"y\":%d,", top);
+                            fprintf(file, "\"w\":%d,", right-left);
+                            fprintf(file, "\"h\":%d", bot-top);
+                            fprintf(file, "}}");
+
+                        }
+                    }
+
+                    fprintf(file, "]}");
+
+                    //save_image(im, "predictions");
+                    //show_image(im, "predictions");
+                    
+                    free_image(im);
+                    free_image(sized);
+                    free(boxes);
+                    free_ptrs((void **)probs, l.w*l.h*l.n);
+
+                    //file exists and can be opened
+                    //...
+                    // close file when you're done
+
+
+
+                    fclose(file);
+
+                    printf("done in %f\n", dt);
+
+                }else{
+                    fprintf("Unable to open file for writing %s", data_path);
+                }
+            }
+        }
+        closedir (dir);
+    } else {
+        /* could not open directory */
+        perror ("");
+        return;
+    }
+}
+
+
 void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filename, float thresh, float hier_thresh)
 {
     list *options = read_data_cfg(datacfg);
@@ -505,7 +720,7 @@ void run_detector(int argc, char **argv)
     int cam_index = find_int_arg(argc, argv, "-c", 0);
     int frame_skip = find_int_arg(argc, argv, "-s", 0);
     if(argc < 4){
-        fprintf(stderr, "usage: %s %s [train/test/valid] [cfg] [weights (optional)]\n", argv[0], argv[1]);
+        fprintf(stderr, "usage: %s %s [train/test/batch_test/valid] [cfg] [weights (optional)]\n", argv[0], argv[1]);
         return;
     }
     char *gpu_list = find_char_arg(argc, argv, "-gpus", 0);
@@ -539,6 +754,7 @@ void run_detector(int argc, char **argv)
     char *weights = (argc > 5) ? argv[5] : 0;
     char *filename = (argc > 6) ? argv[6]: 0;
     if(0==strcmp(argv[2], "test")) test_detector(datacfg, cfg, weights, filename, thresh, hier_thresh);
+    else if(0==strcmp(argv[2], "batch_test")) batch_test_detector(datacfg, cfg, weights, filename, thresh, hier_thresh);
     else if(0==strcmp(argv[2], "train")) train_detector(datacfg, cfg, weights, gpus, ngpus, clear);
     else if(0==strcmp(argv[2], "valid")) validate_detector(datacfg, cfg, weights, outfile);
     else if(0==strcmp(argv[2], "recall")) validate_detector_recall(cfg, weights);
