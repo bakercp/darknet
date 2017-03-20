@@ -497,6 +497,7 @@ void batch_test_detector(char *datacfg, char *cfgfile, char *weightfile, char *f
         while ((ent = readdir (dir)) != NULL)
         {
             if (DT_REG == ent->d_type &&
+                strlen(ent->d_name) > 0 && ent->d_name[0] != '0' &&
                 (ends_with(ent->d_name, ".jpg") ||
                  ends_with(ent->d_name, ".jpeg") ||
                  ends_with(ent->d_name, ".JPG") ||
